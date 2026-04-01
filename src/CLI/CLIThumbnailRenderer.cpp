@@ -537,43 +537,32 @@ ThumbnailData ThumbnailRenderer::render(
         return data;
     }
 
-    // --- Camera: orthographic, matching PrusaSlicer's set_default_orientation() ---
-    // theta=-45° (zenit around X), phi=45° (azimuth around Z).
-    // Camera frames model only; bed extends near/far but not framing.
+    // --- Camera: orthographic, front-right-above ---
+    // Matches the PrusaSlicer GUI default view. Camera frames model only;
+    // bed extends near/far but does not affect framing.
     Eigen::Vector3d center = model_bbox.center();
     Eigen::Vector3d size   = model_bbox.size();
     double max_dim = std::max({size.x(), size.y(), size.z()});
     if (max_dim < 1e-6) max_dim = 1.0;
 
-    // Replicate Camera::set_default_orientation() exactly:
-    // camera_pos = target + distance * (sin_theta*sin_phi, sin_theta*cos_phi, cos_theta)
-    const double theta_rad = -45.0 * M_PI / 180.0;  // zenit
-    const double phi_rad   =  45.0 * M_PI / 180.0;  // azimuth
-    const double sin_theta = std::sin(theta_rad);
-    const double cos_theta = std::cos(theta_rad);
-    const double sin_phi   = std::sin(phi_rad);
-    const double cos_phi   = std::cos(phi_rad);
-    const double dist = max_dim * 2.5;  // far enough for ortho
+    // Camera at front-right-above, matching GUI reference thumbnails.
+    const double dist = max_dim * 2.5;
+    Eigen::Vector3d eye = center + dist * Eigen::Vector3d(0.5, -0.5, 0.707).normalized();
+    Eigen::Vector3d target = center;
+    Eigen::Vector3d up_hint(0, 0, 1);
 
-    Eigen::Vector3d eye = center + dist * Eigen::Vector3d(
-        sin_theta * sin_phi, sin_theta * cos_phi, cos_theta);
+    // Standard look-at view matrix construction.
+    const Eigen::Vector3d unit_z = (eye - target).normalized();
+    const Eigen::Vector3d unit_x = up_hint.cross(unit_z).normalized();
+    const Eigen::Vector3d unit_y = unit_z.cross(unit_x).normalized();
 
-    // View matrix from quaternion rotation, matching Camera::set_default_orientation()
-    Eigen::Quaterniond view_rotation =
-        Eigen::AngleAxisd(theta_rad, Eigen::Vector3d::UnitX()) *
-        Eigen::AngleAxisd(phi_rad, Eigen::Vector3d::UnitZ());
-    view_rotation.normalize();
-
-    // Build view matrix: rotation * translation(-eye)
-    Eigen::Matrix3d rot = view_rotation.toRotationMatrix();
     Eigen::Matrix4d view = Eigen::Matrix4d::Identity();
-    view.block<3,3>(0,0) = rot;
-    view.block<3,1>(0,3) = rot * (-eye);
-
-    // Extract camera basis vectors from the view matrix rows.
-    const Eigen::Vector3d unit_x = view.row(0).head<3>();
-    const Eigen::Vector3d unit_y = view.row(1).head<3>();
-    const Eigen::Vector3d unit_z = view.row(2).head<3>();
+    view(0, 0) = unit_x.x(); view(0, 1) = unit_x.y(); view(0, 2) = unit_x.z();
+    view(0, 3) = -unit_x.dot(eye);
+    view(1, 0) = unit_y.x(); view(1, 1) = unit_y.y(); view(1, 2) = unit_y.z();
+    view(1, 3) = -unit_y.dot(eye);
+    view(2, 0) = unit_z.x(); view(2, 1) = unit_z.y(); view(2, 2) = unit_z.z();
+    view(2, 3) = -unit_z.dot(eye);
 
     // Compute projected bounding box in view space to determine ortho bounds.
     Eigen::Vector3d corners[8] = {
@@ -737,13 +726,14 @@ ThumbnailData ThumbnailRenderer::render(
             if (bed_prog) {
                 // Build textured quad: 4 vertices (P3T2), 2 triangles.
                 // Bed rectangle at Z=-0.02, matching GUI's GROUND_Z.
+                // UV: V-flipped so SVG bottom (PRUSA text) maps to bed front.
                 struct BedVtx { float pos[3]; float uv[2]; };
                 const float z = -0.02f;
                 BedVtx bed_verts[4] = {
-                    {{0,               0,                z}, {0, 1}},  // bottom-left, UV Y-flipped for SVG
-                    {{(float)bed_width, 0,                z}, {1, 1}},
-                    {{(float)bed_width, (float)bed_height, z}, {1, 0}},
-                    {{0,               (float)bed_height, z}, {0, 0}},
+                    {{0,               0,                z}, {0, 0}},  // front-left
+                    {{(float)bed_width, 0,                z}, {1, 0}},  // front-right
+                    {{(float)bed_width, (float)bed_height, z}, {1, 1}},  // back-right
+                    {{0,               (float)bed_height, z}, {0, 1}},  // back-left
                 };
                 unsigned int bed_idx[6] = {0,1,2, 0,2,3};
 
