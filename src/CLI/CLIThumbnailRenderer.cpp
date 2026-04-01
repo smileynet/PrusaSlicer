@@ -547,7 +547,7 @@ ThumbnailData ThumbnailRenderer::render(
 
     // Exact replication of Camera::set_default_orientation() (Camera.cpp:581-590).
     const double theta_rad = -45.0 * M_PI / 180.0;
-    const double phi_rad   = -45.0 * M_PI / 180.0;  // negated vs GUI: pixel flip mirrors horizontally
+    const double phi_rad   = -45.0 * M_PI / 180.0;  // negated: pixel flip mirrors horizontally
     const double sin_theta = std::sin(theta_rad);
     const double dist = max_dim * 2.5;
     Eigen::Vector3d eye = center + dist * Eigen::Vector3d(
@@ -648,6 +648,7 @@ ThumbnailData ThumbnailRenderer::render(
     proj(2, 3) = -(far_z + near_z) / (far_z - near_z);
     proj(3, 3) =  1.0;
 
+
     // Normal matrix = inverse transpose of upper-left 3x3 of view
     Eigen::Matrix3d normal_matrix = view.block<3,3>(0,0).inverse().transpose();
 
@@ -732,18 +733,16 @@ ThumbnailData ThumbnailRenderer::render(
 
             if (bed_prog) {
                 // Build textured quad: 4 vertices (P3T2), 2 triangles.
-                // Bed rectangle at Z=-0.02 (GROUND_Z), matching GUI.
-                // UV: GUI uses inv_size.y *= -1 with GL_REPEAT (no flip). We have a
-                // vertical pixel flip, so use positive V to compensate.
-                // V=0 at front (Y=0, samples SVG top), V=1 at back (Y=max, SVG bottom).
-                // The pixel flip then puts SVG bottom (PRUSA text) at image bottom = bed front.
+                // Bed rectangle at Z=-0.02 (GROUND_Z).
+                // UV: positive V [0,1]. The pixel flip inverts image Y,
+                // so positive V produces the same visual as the GUI's negative V.
                 struct BedVtx { float pos[3]; float uv[2]; };
                 const float z = -0.02f;
                 BedVtx bed_verts[4] = {
-                    {{0,               0,                z}, {0, 0}},  // front-left
-                    {{(float)bed_width, 0,                z}, {1, 0}},  // front-right
-                    {{(float)bed_width, (float)bed_height, z}, {1, 1}},  // back-right
-                    {{0,               (float)bed_height, z}, {0, 1}},  // back-left
+                    {{0,               0,                z}, {0, 0}},
+                    {{(float)bed_width, 0,                z}, {1, 0}},
+                    {{(float)bed_width, (float)bed_height, z}, {1, 1}},
+                    {{0,               (float)bed_height, z}, {0, 1}},
                 };
                 unsigned int bed_idx[6] = {0,1,2, 0,2,3};
 
@@ -814,7 +813,7 @@ ThumbnailData ThumbnailRenderer::render(
     data.set(width, height);
     glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, data.pixels.data());
 
-    // Flip vertically: glReadPixels returns bottom-up, PNG/thumbnail expects top-down.
+    // Flip vertically: glReadPixels returns bottom-up, thumbnails expect top-down.
     const int row_bytes = width * 4;
     std::vector<unsigned char> temp_row(row_bytes);
     for (unsigned int y = 0; y < height / 2; ++y) {
