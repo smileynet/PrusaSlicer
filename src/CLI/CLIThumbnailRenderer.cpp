@@ -538,37 +538,38 @@ ThumbnailData ThumbnailRenderer::render(
     }
 
     // --- Camera: orthographic, matching GUI Camera::set_default_orientation() ---
-    // theta=-45deg zenit, phi=45deg azimuth. Camera at front-left-above,
-    // looking toward back-right. Frames model only.
+    // theta=-45deg zenit, phi=45deg azimuth. Camera at front-left-above.
+    // Bed grid recedes from bottom-right (front-right, near) to top-left (back-left, far).
     Eigen::Vector3d center = model_bbox.center();
     Eigen::Vector3d size   = model_bbox.size();
     double max_dim = std::max({size.x(), size.y(), size.z()});
     if (max_dim < 1e-6) max_dim = 1.0;
 
-    // Replicate GUI view matrix construction exactly.
-    // Camera::set_default_orientation uses:
-    //   view_rotation = AngleAxis(theta, X) * AngleAxis(phi, Z)
-    //   view_matrix = fromPositionOrientationScale(R * (-cam_pos), R, 1)
+    // Exact replication of Camera::set_default_orientation() (Camera.cpp:581-590).
     const double theta_rad = -45.0 * M_PI / 180.0;
-    const double phi_rad   =  45.0 * M_PI / 180.0;
+    const double phi_rad   =  45.0 * M_PI / 180.0;  // GUI default
     const double sin_theta = std::sin(theta_rad);
     const double dist = max_dim * 2.5;
-    Eigen::Vector3d cam_pos = center + dist * Eigen::Vector3d(
+    Eigen::Vector3d eye = center + dist * Eigen::Vector3d(
         sin_theta * std::sin(phi_rad),
         sin_theta * std::cos(phi_rad),
         std::cos(theta_rad));
 
-    // View rotation and matrix, matching Camera::set_default_orientation() line 588-590.
-    Eigen::Matrix3d rot = (Eigen::AngleAxisd(theta_rad, Eigen::Vector3d::UnitX())
-        * Eigen::AngleAxisd(phi_rad, Eigen::Vector3d::UnitZ())).toRotationMatrix();
-    Eigen::Matrix4d view = Eigen::Matrix4d::Identity();
-    view.block<3,3>(0,0) = rot;
-    view.block<3,1>(0,3) = rot * (-cam_pos);
+    // View matrix from quaternion rotation (Eigen::fromPositionOrientationScale).
+    // linear() = R, translation() = R * (-eye).
+    Eigen::Quaterniond view_rotation =
+        Eigen::AngleAxisd(theta_rad, Eigen::Vector3d::UnitX()) *
+        Eigen::AngleAxisd(phi_rad, Eigen::Vector3d::UnitZ());
+    view_rotation.normalize();
+    Eigen::Matrix3d R = view_rotation.toRotationMatrix();
 
-    // Camera basis vectors for projection computation.
-    const Eigen::Vector3d unit_x = view.row(0).head<3>();
-    const Eigen::Vector3d unit_y = view.row(1).head<3>();
-    const Eigen::Vector3d unit_z = view.row(2).head<3>();
+    Eigen::Matrix4d view = Eigen::Matrix4d::Identity();
+    view.block<3,3>(0,0) = R;
+    view.block<3,1>(0,3) = R * (-eye);
+
+    const Eigen::Vector3d unit_x = R.row(0);
+    const Eigen::Vector3d unit_y = R.row(1);
+    const Eigen::Vector3d unit_z = R.row(2);
 
     // Compute projected bounding box in view space to determine ortho bounds.
     Eigen::Vector3d corners[8] = {
@@ -731,15 +732,19 @@ ThumbnailData ThumbnailRenderer::render(
 
             if (bed_prog) {
                 // Build textured quad: 4 vertices (P3T2), 2 triangles.
-                // Bed rectangle at Z=-0.02, matching GUI's GROUND_Z.
-                // UV: V-flipped so SVG bottom (PRUSA text) maps to bed front.
+                // Bed rectangle at Z=-0.02 (GROUND_Z), matching GUI.
+                // UV matches GUI init_triangles(): inv_size.y *= -1 produces
+                // V in [0, -1]. With GL_REPEAT, negative V wraps and effectively
+                // inverts the texture Y axis (SVG bottom maps to bed front).
                 struct BedVtx { float pos[3]; float uv[2]; };
                 const float z = -0.02f;
+                const float inv_w = 1.0f / (float)bed_width;
+                const float inv_h = -1.0f / (float)bed_height;  // negated, matching GUI
                 BedVtx bed_verts[4] = {
-                    {{0,               0,                z}, {0, 0}},  // front-left
-                    {{(float)bed_width, 0,                z}, {1, 0}},  // front-right
-                    {{(float)bed_width, (float)bed_height, z}, {1, 1}},  // back-right
-                    {{0,               (float)bed_height, z}, {0, 1}},  // back-left
+                    {{0,               0,                z}, {0,                        0}},
+                    {{(float)bed_width, 0,                z}, {(float)bed_width * inv_w, 0}},
+                    {{(float)bed_width, (float)bed_height, z}, {(float)bed_width * inv_w, (float)bed_height * inv_h}},
+                    {{0,               (float)bed_height, z}, {0,                        (float)bed_height * inv_h}},
                 };
                 unsigned int bed_idx[6] = {0,1,2, 0,2,3};
 
@@ -806,16 +811,10 @@ ThumbnailData ThumbnailRenderer::render(
     data.set(width, height);
     glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, data.pixels.data());
 
-    // Flip vertically (OpenGL origin at bottom-left, thumbnails at top-left)
-    const int row_bytes = width * 4;
-    std::vector<unsigned char> temp_row(row_bytes);
-    for (unsigned int y = 0; y < height / 2; ++y) {
-        unsigned char* top    = data.pixels.data() + y * row_bytes;
-        unsigned char* bottom = data.pixels.data() + (height - 1 - y) * row_bytes;
-        std::memcpy(temp_row.data(), top, row_bytes);
-        std::memcpy(top, bottom, row_bytes);
-        std::memcpy(bottom, temp_row.data(), row_bytes);
-    }
+    // NOTE: No vertical flip. The GUI's _render_thumbnail_framebuffer reads pixels
+    // via glReadPixels into ThumbnailData which is consumed directly by the gcode
+    // writer. The PNG encoder handles row order. Our ThumbnailData follows the same
+    // convention: row 0 = bottom of GL framebuffer = bottom of thumbnail.
 
     // --- Cleanup ---
     p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
