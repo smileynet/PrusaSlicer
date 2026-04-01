@@ -307,40 +307,47 @@ ThumbnailData ThumbnailRenderer::render(
 
     for (const ModelObject* obj : model.objects) {
         for (const ModelVolume* vol : obj->volumes) {
-            if (vol->is_model_part()) {
-                const TriangleMesh& mesh = vol->mesh();
-                const auto& its = mesh.its;
+            if (!vol->is_model_part()) continue;
+            const TriangleMesh& mesh = vol->mesh();
+            const auto& its = mesh.its;
+
+            // Compute area-weighted per-vertex normals (smooth shading).
+            // Unnormalized cross products are proportional to triangle area,
+            // so summing them naturally weights by area.
+            std::vector<Eigen::Vector3f> vnormals(its.vertices.size(), Eigen::Vector3f::Zero());
+            for (const auto& face : its.indices) {
+                const Eigen::Vector3f& v0 = its.vertices[face[0]];
+                const Eigen::Vector3f& v1 = its.vertices[face[1]];
+                const Eigen::Vector3f& v2 = its.vertices[face[2]];
+                Eigen::Vector3f area_normal = (v1 - v0).cross(v2 - v0);
+                vnormals[face[0]] += area_normal;
+                vnormals[face[1]] += area_normal;
+                vnormals[face[2]] += area_normal;
+            }
+
+            // Emit one copy of transformed geometry per instance.
+            for (const ModelInstance* inst : obj->instances) {
+                const Transform3d& xform = inst->get_matrix();
+                const Eigen::Matrix3f norm_xform =
+                    xform.matrix().block<3,3>(0,0).inverse().transpose().cast<float>();
+
                 const unsigned int base_idx = (unsigned int)vertices.size();
-
-                // Compute per-face normals, expand to per-vertex
-                // (flat shading via duplicated vertices for correctness;
-                //  the shader does Gouraud interpolation which gives
-                //  smooth appearance on smooth meshes)
+                for (size_t i = 0; i < its.vertices.size(); ++i) {
+                    Eigen::Vector3f pos = (xform * its.vertices[i].cast<double>()).cast<float>();
+                    Eigen::Vector3f raw_n = norm_xform * vnormals[i];
+                    float len = raw_n.norm();
+                    Eigen::Vector3f n = (len > 1e-10f) ? Eigen::Vector3f(raw_n / len) : Eigen::Vector3f::UnitZ();
+                    vertices.push_back({{pos.x(), pos.y(), pos.z()}, {n.x(), n.y(), n.z()}});
+                }
                 for (const auto& face : its.indices) {
-                    const auto& v0 = its.vertices[face[0]];
-                    const auto& v1 = its.vertices[face[1]];
-                    const auto& v2 = its.vertices[face[2]];
-
-                    // Face normal
-                    Eigen::Vector3f e1 = (v1 - v0).cast<float>();
-                    Eigen::Vector3f e2 = (v2 - v0).cast<float>();
-                    Eigen::Vector3f n = e1.cross(e2).normalized();
-
-                    unsigned int idx = (unsigned int)vertices.size();
-                    vertices.push_back({{v0.x(), v0.y(), v0.z()}, {n.x(), n.y(), n.z()}});
-                    vertices.push_back({{v1.x(), v1.y(), v1.z()}, {n.x(), n.y(), n.z()}});
-                    vertices.push_back({{v2.x(), v2.y(), v2.z()}, {n.x(), n.y(), n.z()}});
-                    indices.push_back(idx);
-                    indices.push_back(idx + 1);
-                    indices.push_back(idx + 2);
+                    indices.push_back(base_idx + face[0]);
+                    indices.push_back(base_idx + face[1]);
+                    indices.push_back(base_idx + face[2]);
                 }
 
-                // Update bbox with transformed mesh bounds
-                for (const ModelInstance* inst : obj->instances) {
-                    BoundingBoxf3 inst_bb = mesh.bounding_box();
-                    inst_bb = inst_bb.transformed(inst->get_matrix());
-                    bbox.merge(inst_bb);
-                }
+                BoundingBoxf3 inst_bb = mesh.bounding_box();
+                inst_bb = inst_bb.transformed(xform);
+                bbox.merge(inst_bb);
             }
         }
     }
@@ -496,11 +503,11 @@ ThumbnailData ThumbnailRenderer::render(
     GLint loc_color = p_glGetUniformLocation(prog, "uniform_color");
     GLint loc_emission = p_glGetUniformLocation(prog, "emission_factor");
 
-    // GL_TRUE: our matrices are built row-by-row via (row,col) element access,
-    // which in Eigen column-major storage produces a transposed layout vs GL.
-    p_glUniformMatrix4fv(loc_vm, 1, GL_TRUE, view_f.data());
-    p_glUniformMatrix4fv(loc_pj, 1, GL_TRUE, proj_f.data());
-    p_glUniformMatrix3fv(loc_nm, 1, GL_TRUE, norm_f.data());
+    // GL_FALSE: Eigen stores matrices column-major, same as OpenGL expects.
+    // No transpose needed. (GL_TRUE was a latent bug masked by near-origin coords.)
+    p_glUniformMatrix4fv(loc_vm, 1, GL_FALSE, view_f.data());
+    p_glUniformMatrix4fv(loc_pj, 1, GL_FALSE, proj_f.data());
+    p_glUniformMatrix3fv(loc_nm, 1, GL_FALSE, norm_f.data());
     p_glUniform4f(loc_color, color_r, color_g, color_b, color_a);
     p_glUniform1f(loc_emission, 0.0f);
 
