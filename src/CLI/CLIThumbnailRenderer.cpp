@@ -352,41 +352,43 @@ ThumbnailData ThumbnailRenderer::render(
     ThumbnailData data;
     if (!s_initialized) return data;
 
-    // Collect all mesh geometry into shared vertex/index buffers.
+    // Collect geometry into shared vertex/index buffers.
+    // Model and bed use separate bounding boxes: model_bbox frames the camera,
+    // bed_bbox only extends near/far planes (matching GUI behavior).
     std::vector<Vertex> vertices;
     std::vector<unsigned int> indices;
-    BoundingBoxf3 bbox;
+    BoundingBoxf3 model_bbox;
+    BoundingBoxf3 bed_bbox;
 
-    // --- Bed plate (rendered first, behind model) ---
-    unsigned int bed_index_count = 0;
-    if (!bed_model_path.empty()) {
-        TriangleMesh bed_mesh;
-        if (bed_mesh.ReadSTLFile(bed_model_path.c_str())) {
-            // Position bed at bed center, slightly below Z=0 to avoid z-fighting.
-            Eigen::Matrix4d bed_xform = Eigen::Matrix4d::Identity();
-            bed_xform(0, 3) = bed_center_x;
-            bed_xform(1, 3) = bed_center_y;
-            bed_xform(2, 3) = -0.03;
-            append_mesh(bed_mesh.its, bed_xform, vertices, indices, bbox);
-            bed_index_count = (unsigned int)indices.size();
-        } else {
-            BOOST_LOG_TRIVIAL(warning) << "CLI Thumbnail: Could not load bed model: " << bed_model_path;
-        }
-    }
-
-    // --- Model geometry ---
-    const unsigned int model_index_start = (unsigned int)indices.size();
+    // --- Model geometry (drives camera framing) ---
     for (const ModelObject* obj : model.objects) {
         for (const ModelVolume* vol : obj->volumes) {
             if (!vol->is_model_part()) continue;
             const TriangleMesh& mesh = vol->mesh();
             for (const ModelInstance* inst : obj->instances)
-                append_mesh(mesh.its, inst->get_matrix().matrix(), vertices, indices, bbox);
+                append_mesh(mesh.its, inst->get_matrix().matrix(), vertices, indices, model_bbox);
         }
     }
-    const unsigned int model_index_count = (unsigned int)indices.size() - model_index_start;
+    const unsigned int model_index_count = (unsigned int)indices.size();
 
-    if (vertices.empty()) return data;
+    // --- Bed plate (cosmetic backdrop, does not affect framing) ---
+    const unsigned int bed_index_start = (unsigned int)indices.size();
+    unsigned int bed_index_count = 0;
+    if (!bed_model_path.empty()) {
+        TriangleMesh bed_mesh;
+        if (bed_mesh.ReadSTLFile(bed_model_path.c_str())) {
+            Eigen::Matrix4d bed_xform = Eigen::Matrix4d::Identity();
+            bed_xform(0, 3) = bed_center_x;
+            bed_xform(1, 3) = bed_center_y;
+            bed_xform(2, 3) = -0.03;
+            append_mesh(bed_mesh.its, bed_xform, vertices, indices, bed_bbox);
+            bed_index_count = (unsigned int)indices.size() - bed_index_start;
+        } else {
+            BOOST_LOG_TRIVIAL(warning) << "CLI Thumbnail: Could not load bed model: " << bed_model_path;
+        }
+    }
+
+    if (model_index_count == 0) return data;
     // --- Compile shaders ---
     GLuint vs = compile_shader(GL_VERTEX_SHADER, VS_SOURCE);
     GLuint fs = compile_shader(GL_FRAGMENT_SHADER, FS_SOURCE);
@@ -429,11 +431,11 @@ ThumbnailData ThumbnailRenderer::render(
         return data;
     }
 
-    // --- Camera: orthographic, zoom to bounding box ---
-    // Same approach as GLCanvas3D::_render_thumbnail_internal:
-    // camera.zoom_to_box(volumes_box) with ortho projection.
-    Eigen::Vector3d center = bbox.center();
-    Eigen::Vector3d size   = bbox.size();
+    // --- Camera: orthographic, zoom to model bounding box ---
+    // Matches GLCanvas3D::_render_thumbnail_internal: camera frames model only,
+    // bed extends near/far but does not affect framing.
+    Eigen::Vector3d center = model_bbox.center();
+    Eigen::Vector3d size   = model_bbox.size();
     double max_dim = std::max({size.x(), size.y(), size.z()});
     if (max_dim < 1e-6) max_dim = 1.0;
 
@@ -459,14 +461,14 @@ ThumbnailData ThumbnailRenderer::render(
 
     // Compute projected bounding box in view space to determine ortho bounds.
     Eigen::Vector3d corners[8] = {
-        {bbox.min.x(), bbox.min.y(), bbox.min.z()},
-        {bbox.max.x(), bbox.min.y(), bbox.min.z()},
-        {bbox.min.x(), bbox.max.y(), bbox.min.z()},
-        {bbox.max.x(), bbox.max.y(), bbox.min.z()},
-        {bbox.min.x(), bbox.min.y(), bbox.max.z()},
-        {bbox.max.x(), bbox.min.y(), bbox.max.z()},
-        {bbox.min.x(), bbox.max.y(), bbox.max.z()},
-        {bbox.max.x(), bbox.max.y(), bbox.max.z()},
+        {model_bbox.min.x(), model_bbox.min.y(), model_bbox.min.z()},
+        {model_bbox.max.x(), model_bbox.min.y(), model_bbox.min.z()},
+        {model_bbox.min.x(), model_bbox.max.y(), model_bbox.min.z()},
+        {model_bbox.max.x(), model_bbox.max.y(), model_bbox.min.z()},
+        {model_bbox.min.x(), model_bbox.min.y(), model_bbox.max.z()},
+        {model_bbox.max.x(), model_bbox.min.y(), model_bbox.max.z()},
+        {model_bbox.min.x(), model_bbox.max.y(), model_bbox.max.z()},
+        {model_bbox.max.x(), model_bbox.max.y(), model_bbox.max.z()},
     };
 
     // Project bbox corners onto camera XY plane (same as Camera::calc_zoom_to_bounding_box_factor)
@@ -486,6 +488,26 @@ ThumbnailData ThumbnailRenderer::render(
         Eigen::Vector4d pe = view * Eigen::Vector4d(corners[i].x(), corners[i].y(), corners[i].z(), 1.0);
         min_z_eye = std::min(min_z_eye, pe.z());
         max_z_eye = std::max(max_z_eye, pe.z());
+    }
+
+    // Extend near/far to include bed so it isn't clipped,
+    // but don't affect the XY framing (matching GUI behavior).
+    if (bed_bbox.defined) {
+        Eigen::Vector3d bed_corners[8] = {
+            {bed_bbox.min.x(), bed_bbox.min.y(), bed_bbox.min.z()},
+            {bed_bbox.max.x(), bed_bbox.min.y(), bed_bbox.min.z()},
+            {bed_bbox.min.x(), bed_bbox.max.y(), bed_bbox.min.z()},
+            {bed_bbox.max.x(), bed_bbox.max.y(), bed_bbox.min.z()},
+            {bed_bbox.min.x(), bed_bbox.min.y(), bed_bbox.max.z()},
+            {bed_bbox.max.x(), bed_bbox.min.y(), bed_bbox.max.z()},
+            {bed_bbox.min.x(), bed_bbox.max.y(), bed_bbox.max.z()},
+            {bed_bbox.max.x(), bed_bbox.max.y(), bed_bbox.max.z()},
+        };
+        for (int i = 0; i < 8; ++i) {
+            Eigen::Vector4d pe = view * Eigen::Vector4d(bed_corners[i].x(), bed_corners[i].y(), bed_corners[i].z(), 1.0);
+            min_z_eye = std::min(min_z_eye, pe.z());
+            max_z_eye = std::max(max_z_eye, pe.z());
+        }
     }
 
     // Add 2.5% margin (matching Camera::DefaultZoomToBoxMarginFactor)
@@ -524,7 +546,7 @@ ThumbnailData ThumbnailRenderer::render(
 
     // --- Render ---
     glViewport(0, 0, width, height);
-    glClearColor(0.93f, 0.93f, 0.95f, 1.0f);  // Light grey background
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);  // Transparent background (matches GUI)
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     glEnable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);  // Mesh normals may not be consistently oriented
@@ -569,17 +591,20 @@ ThumbnailData ThumbnailRenderer::render(
     p_glVertexAttribPointer(loc_nor, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex),
         (const void*)offsetof(Vertex, normal));
 
-    // Draw bed plate first (dark grey, behind model).
-    if (bed_index_count > 0) {
-        p_glUniform4f(loc_color, 0.25f, 0.25f, 0.25f, 1.0f);
-        glDrawElements(GL_TRIANGLES, (GLsizei)bed_index_count, GL_UNSIGNED_INT, nullptr);
-    }
-
-    // Draw model (user-specified color, default orange).
+    // Pass 1: Model with depth test (fills depth buffer).
     if (model_index_count > 0) {
         p_glUniform4f(loc_color, color_r, color_g, color_b, color_a);
-        glDrawElements(GL_TRIANGLES, (GLsizei)model_index_count, GL_UNSIGNED_INT,
-            (const void*)(model_index_start * sizeof(unsigned int)));
+        glDrawElements(GL_TRIANGLES, (GLsizei)model_index_count, GL_UNSIGNED_INT, nullptr);
+    }
+
+    // Pass 2: Bed with depth test ON.
+    // Bed sits at Z~0 below the model. The depth buffer from Pass 1 ensures
+    // the model naturally occludes the bed via Z ordering.
+    // (GUI: render_internal re-enables depth test despite caller disabling it.)
+    if (bed_index_count > 0) {
+        p_glUniform4f(loc_color, 0.25f, 0.25f, 0.25f, 1.0f);
+        glDrawElements(GL_TRIANGLES, (GLsizei)bed_index_count, GL_UNSIGNED_INT,
+            (const void*)(bed_index_start * sizeof(unsigned int)));
     }
 
     p_glDisableVertexAttribArray(loc_pos);
