@@ -537,32 +537,38 @@ ThumbnailData ThumbnailRenderer::render(
         return data;
     }
 
-    // --- Camera: orthographic, front-right-above ---
-    // Matches the PrusaSlicer GUI default view. Camera frames model only;
-    // bed extends near/far but does not affect framing.
+    // --- Camera: orthographic, matching GUI Camera::set_default_orientation() ---
+    // theta=-45deg zenit, phi=45deg azimuth. Camera at front-left-above,
+    // looking toward back-right. Frames model only.
     Eigen::Vector3d center = model_bbox.center();
     Eigen::Vector3d size   = model_bbox.size();
     double max_dim = std::max({size.x(), size.y(), size.z()});
     if (max_dim < 1e-6) max_dim = 1.0;
 
-    // Camera at front-right-above, matching GUI reference thumbnails.
+    // Replicate GUI view matrix construction exactly.
+    // Camera::set_default_orientation uses:
+    //   view_rotation = AngleAxis(theta, X) * AngleAxis(phi, Z)
+    //   view_matrix = fromPositionOrientationScale(R * (-cam_pos), R, 1)
+    const double theta_rad = -45.0 * M_PI / 180.0;
+    const double phi_rad   =  45.0 * M_PI / 180.0;
+    const double sin_theta = std::sin(theta_rad);
     const double dist = max_dim * 2.5;
-    Eigen::Vector3d eye = center + dist * Eigen::Vector3d(0.5, -0.5, 0.707).normalized();
-    Eigen::Vector3d target = center;
-    Eigen::Vector3d up_hint(0, 0, 1);
+    Eigen::Vector3d cam_pos = center + dist * Eigen::Vector3d(
+        sin_theta * std::sin(phi_rad),
+        sin_theta * std::cos(phi_rad),
+        std::cos(theta_rad));
 
-    // Standard look-at view matrix construction.
-    const Eigen::Vector3d unit_z = (eye - target).normalized();
-    const Eigen::Vector3d unit_x = up_hint.cross(unit_z).normalized();
-    const Eigen::Vector3d unit_y = unit_z.cross(unit_x).normalized();
-
+    // View rotation and matrix, matching Camera::set_default_orientation() line 588-590.
+    Eigen::Matrix3d rot = (Eigen::AngleAxisd(theta_rad, Eigen::Vector3d::UnitX())
+        * Eigen::AngleAxisd(phi_rad, Eigen::Vector3d::UnitZ())).toRotationMatrix();
     Eigen::Matrix4d view = Eigen::Matrix4d::Identity();
-    view(0, 0) = unit_x.x(); view(0, 1) = unit_x.y(); view(0, 2) = unit_x.z();
-    view(0, 3) = -unit_x.dot(eye);
-    view(1, 0) = unit_y.x(); view(1, 1) = unit_y.y(); view(1, 2) = unit_y.z();
-    view(1, 3) = -unit_y.dot(eye);
-    view(2, 0) = unit_z.x(); view(2, 1) = unit_z.y(); view(2, 2) = unit_z.z();
-    view(2, 3) = -unit_z.dot(eye);
+    view.block<3,3>(0,0) = rot;
+    view.block<3,1>(0,3) = rot * (-cam_pos);
+
+    // Camera basis vectors for projection computation.
+    const Eigen::Vector3d unit_x = view.row(0).head<3>();
+    const Eigen::Vector3d unit_y = view.row(1).head<3>();
+    const Eigen::Vector3d unit_z = view.row(2).head<3>();
 
     // Compute projected bounding box in view space to determine ortho bounds.
     Eigen::Vector3d corners[8] = {
