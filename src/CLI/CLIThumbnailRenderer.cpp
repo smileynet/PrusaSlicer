@@ -547,7 +547,7 @@ ThumbnailData ThumbnailRenderer::render(
 
     // Exact replication of Camera::set_default_orientation() (Camera.cpp:581-590).
     const double theta_rad = -45.0 * M_PI / 180.0;
-    const double phi_rad   =  45.0 * M_PI / 180.0;  // GUI default
+    const double phi_rad   = -45.0 * M_PI / 180.0;  // negated vs GUI: pixel flip mirrors horizontally
     const double sin_theta = std::sin(theta_rad);
     const double dist = max_dim * 2.5;
     Eigen::Vector3d eye = center + dist * Eigen::Vector3d(
@@ -733,18 +733,17 @@ ThumbnailData ThumbnailRenderer::render(
             if (bed_prog) {
                 // Build textured quad: 4 vertices (P3T2), 2 triangles.
                 // Bed rectangle at Z=-0.02 (GROUND_Z), matching GUI.
-                // UV matches GUI init_triangles(): inv_size.y *= -1 produces
-                // V in [0, -1]. With GL_REPEAT, negative V wraps and effectively
-                // inverts the texture Y axis (SVG bottom maps to bed front).
+                // UV: GUI uses inv_size.y *= -1 with GL_REPEAT (no flip). We have a
+                // vertical pixel flip, so use positive V to compensate.
+                // V=0 at front (Y=0, samples SVG top), V=1 at back (Y=max, SVG bottom).
+                // The pixel flip then puts SVG bottom (PRUSA text) at image bottom = bed front.
                 struct BedVtx { float pos[3]; float uv[2]; };
                 const float z = -0.02f;
-                const float inv_w = 1.0f / (float)bed_width;
-                const float inv_h = -1.0f / (float)bed_height;  // negated, matching GUI
                 BedVtx bed_verts[4] = {
-                    {{0,               0,                z}, {0,                        0}},
-                    {{(float)bed_width, 0,                z}, {(float)bed_width * inv_w, 0}},
-                    {{(float)bed_width, (float)bed_height, z}, {(float)bed_width * inv_w, (float)bed_height * inv_h}},
-                    {{0,               (float)bed_height, z}, {0,                        (float)bed_height * inv_h}},
+                    {{0,               0,                z}, {0, 0}},  // front-left
+                    {{(float)bed_width, 0,                z}, {1, 0}},  // front-right
+                    {{(float)bed_width, (float)bed_height, z}, {1, 1}},  // back-right
+                    {{0,               (float)bed_height, z}, {0, 1}},  // back-left
                 };
                 unsigned int bed_idx[6] = {0,1,2, 0,2,3};
 
@@ -777,10 +776,12 @@ ThumbnailData ThumbnailRenderer::render(
                 glBindTexture(GL_TEXTURE_2D, bed_tex);
                 p_glUniform1i(p_glGetUniformLocation(bed_prog, "in_texture"), 0);
 
+                glDepthMask(GL_FALSE);  // Bed never writes depth -- can't obscure model
                 glEnable(GL_BLEND);
                 glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
                 glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, nullptr);
                 glDisable(GL_BLEND);
+                glDepthMask(GL_TRUE);
 
                 glBindTexture(GL_TEXTURE_2D, 0);
                 p_glDisableVertexAttribArray(bed_loc_pos);
@@ -795,9 +796,11 @@ ThumbnailData ThumbnailRenderer::render(
         }
     } else if (bed_stl_index_count > 0) {
         // Fallback: dark grey STL bed model.
+        glDepthMask(GL_FALSE);
         p_glUniform4f(loc_color, 0.25f, 0.25f, 0.25f, 1.0f);
         glDrawElements(GL_TRIANGLES, (GLsizei)bed_stl_index_count, GL_UNSIGNED_INT,
             (const void*)(bed_stl_index_start * sizeof(unsigned int)));
+        glDepthMask(GL_TRUE);
     }
 
     p_glDisableVertexAttribArray(loc_pos);
@@ -811,10 +814,16 @@ ThumbnailData ThumbnailRenderer::render(
     data.set(width, height);
     glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, data.pixels.data());
 
-    // NOTE: No vertical flip. The GUI's _render_thumbnail_framebuffer reads pixels
-    // via glReadPixels into ThumbnailData which is consumed directly by the gcode
-    // writer. The PNG encoder handles row order. Our ThumbnailData follows the same
-    // convention: row 0 = bottom of GL framebuffer = bottom of thumbnail.
+    // Flip vertically: glReadPixels returns bottom-up, PNG/thumbnail expects top-down.
+    const int row_bytes = width * 4;
+    std::vector<unsigned char> temp_row(row_bytes);
+    for (unsigned int y = 0; y < height / 2; ++y) {
+        unsigned char* top    = data.pixels.data() + y * row_bytes;
+        unsigned char* bottom = data.pixels.data() + (height - 1 - y) * row_bytes;
+        std::memcpy(temp_row.data(), top, row_bytes);
+        std::memcpy(top, bottom, row_bytes);
+        std::memcpy(bottom, temp_row.data(), row_bytes);
+    }
 
     // --- Cleanup ---
     p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
