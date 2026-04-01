@@ -19,6 +19,7 @@
 #include <boost/algorithm/string/split.hpp>
 #endif // !SLIC3R_OPENGL_ES
 #include "libslic3r/Config.hpp"
+#include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/Geometry.hpp"
 #include "libslic3r/GCode/PostProcessor.hpp"
 #include "libslic3r/Model.hpp"
@@ -394,11 +395,24 @@ bool process_actions(Data& cli, const DynamicPrintConfig& print_config, std::vec
                     // replace it with one that uses ThumbnailRenderer if EGL is available.
                     if (!boost::iends_with(input_file, ".3mf") && ThumbnailRenderer::init()) {
                         const Model& mdl = fff_print.model();
-                        thumbnail_cb = [&mdl](const ThumbnailsParams& params) -> ThumbnailsList {
+                        // Extract bed model path and bed center from config.
+                        std::string bed_model_path;
+                        double bed_cx = 0.0, bed_cy = 0.0;
+                        if (auto* opt = print_config.opt<ConfigOptionString>("bed_custom_model"))
+                            bed_model_path = opt->value;
+                        if (auto* opt = print_config.opt<ConfigOptionPoints>("bed_shape")) {
+                            BoundingBoxf bb;
+                            for (const Vec2d& p : opt->values) bb.merge(p);
+                            Vec2d center = bb.center();
+                            bed_cx = center.x();
+                            bed_cy = center.y();
+                        }
+                        thumbnail_cb = [&mdl, bed_model_path, bed_cx, bed_cy](const ThumbnailsParams& params) -> ThumbnailsList {
                             ThumbnailsList out;
                             for (const Vec2d& sz : params.sizes) {
                                 Point isz(sz);
-                                ThumbnailData td = ThumbnailRenderer::render(mdl, isz.x(), isz.y());
+                                ThumbnailData td = ThumbnailRenderer::render(mdl, isz.x(), isz.y(),
+                                    1.0f, 0.5f, 0.0f, 1.0f, bed_model_path, bed_cx, bed_cy);
                                 if (td.is_valid())
                                     out.push_back(std::move(td));
                             }

@@ -289,68 +289,102 @@ static GLuint compile_shader(GLenum type, const char* source)
     return shader;
 }
 
+// Interleaved vertex: position + normal, 24 bytes.
+struct Vertex { float pos[3]; float normal[3]; };
+
+// Append a mesh (with smooth normals) to the shared vertex/index buffers.
+// Applies the given affine transform to positions and its inverse-transpose to normals.
+static void append_mesh(
+    const indexed_triangle_set& its,
+    const Eigen::Matrix4d& xform_mat,
+    std::vector<Vertex>& vertices,
+    std::vector<unsigned int>& indices,
+    BoundingBoxf3& bbox)
+{
+    using Eigen::Vector3f;
+    using Eigen::Matrix3f;
+    const Transform3d xform(xform_mat);
+    const Matrix3f norm_xform = xform_mat.block<3,3>(0,0).inverse().transpose().cast<float>();
+
+    // Pass 1: area-weighted per-vertex normals
+    std::vector<Vector3f> vnormals(its.vertices.size(), Vector3f::Zero());
+    for (const auto& face : its.indices) {
+        const Vector3f& v0 = its.vertices[face[0]];
+        const Vector3f& v1 = its.vertices[face[1]];
+        const Vector3f& v2 = its.vertices[face[2]];
+        Vector3f area_normal = (v1 - v0).cross(v2 - v0);
+        vnormals[face[0]] += area_normal;
+        vnormals[face[1]] += area_normal;
+        vnormals[face[2]] += area_normal;
+    }
+
+    // Pass 2: transformed positions + normalized normals
+    const unsigned int base_idx = (unsigned int)vertices.size();
+    for (size_t i = 0; i < its.vertices.size(); ++i) {
+        Vector3f pos = (xform * its.vertices[i].cast<double>()).cast<float>();
+        Vector3f raw_n = norm_xform * vnormals[i];
+        float len = raw_n.norm();
+        Vector3f n = (len > 1e-10f) ? Vector3f(raw_n / len) : Vector3f::UnitZ();
+        vertices.push_back({{pos.x(), pos.y(), pos.z()}, {n.x(), n.y(), n.z()}});
+    }
+    for (const auto& face : its.indices) {
+        indices.push_back(base_idx + face[0]);
+        indices.push_back(base_idx + face[1]);
+        indices.push_back(base_idx + face[2]);
+    }
+
+    // Expand bounding box with transformed mesh bounds
+    TriangleMesh tmesh(its);
+    BoundingBoxf3 mesh_bb = tmesh.bounding_box();
+    mesh_bb = mesh_bb.transformed(xform);
+    bbox.merge(mesh_bb);
+}
+
 
 ThumbnailData ThumbnailRenderer::render(
     const Model& model,
     unsigned int width, unsigned int height,
-    float color_r, float color_g, float color_b, float color_a)
+    float color_r, float color_g, float color_b, float color_a,
+    const std::string& bed_model_path,
+    double bed_center_x, double bed_center_y)
+
 {
     ThumbnailData data;
     if (!s_initialized) return data;
 
-    // Collect all mesh geometry into interleaved vertex buffer:
-    // [px, py, pz, nx, ny, nz] per vertex, indexed triangles.
-    struct Vertex { float pos[3]; float normal[3]; };
+    // Collect all mesh geometry into shared vertex/index buffers.
     std::vector<Vertex> vertices;
     std::vector<unsigned int> indices;
     BoundingBoxf3 bbox;
 
+    // --- Bed plate (rendered first, behind model) ---
+    unsigned int bed_index_count = 0;
+    if (!bed_model_path.empty()) {
+        TriangleMesh bed_mesh;
+        if (bed_mesh.ReadSTLFile(bed_model_path.c_str())) {
+            // Position bed at bed center, slightly below Z=0 to avoid z-fighting.
+            Eigen::Matrix4d bed_xform = Eigen::Matrix4d::Identity();
+            bed_xform(0, 3) = bed_center_x;
+            bed_xform(1, 3) = bed_center_y;
+            bed_xform(2, 3) = -0.03;
+            append_mesh(bed_mesh.its, bed_xform, vertices, indices, bbox);
+            bed_index_count = (unsigned int)indices.size();
+        } else {
+            BOOST_LOG_TRIVIAL(warning) << "CLI Thumbnail: Could not load bed model: " << bed_model_path;
+        }
+    }
+
+    // --- Model geometry ---
+    const unsigned int model_index_start = (unsigned int)indices.size();
     for (const ModelObject* obj : model.objects) {
         for (const ModelVolume* vol : obj->volumes) {
             if (!vol->is_model_part()) continue;
             const TriangleMesh& mesh = vol->mesh();
-            const auto& its = mesh.its;
-
-            // Compute area-weighted per-vertex normals (smooth shading).
-            // Unnormalized cross products are proportional to triangle area,
-            // so summing them naturally weights by area.
-            std::vector<Eigen::Vector3f> vnormals(its.vertices.size(), Eigen::Vector3f::Zero());
-            for (const auto& face : its.indices) {
-                const Eigen::Vector3f& v0 = its.vertices[face[0]];
-                const Eigen::Vector3f& v1 = its.vertices[face[1]];
-                const Eigen::Vector3f& v2 = its.vertices[face[2]];
-                Eigen::Vector3f area_normal = (v1 - v0).cross(v2 - v0);
-                vnormals[face[0]] += area_normal;
-                vnormals[face[1]] += area_normal;
-                vnormals[face[2]] += area_normal;
-            }
-
-            // Emit one copy of transformed geometry per instance.
-            for (const ModelInstance* inst : obj->instances) {
-                const Transform3d& xform = inst->get_matrix();
-                const Eigen::Matrix3f norm_xform =
-                    xform.matrix().block<3,3>(0,0).inverse().transpose().cast<float>();
-
-                const unsigned int base_idx = (unsigned int)vertices.size();
-                for (size_t i = 0; i < its.vertices.size(); ++i) {
-                    Eigen::Vector3f pos = (xform * its.vertices[i].cast<double>()).cast<float>();
-                    Eigen::Vector3f raw_n = norm_xform * vnormals[i];
-                    float len = raw_n.norm();
-                    Eigen::Vector3f n = (len > 1e-10f) ? Eigen::Vector3f(raw_n / len) : Eigen::Vector3f::UnitZ();
-                    vertices.push_back({{pos.x(), pos.y(), pos.z()}, {n.x(), n.y(), n.z()}});
-                }
-                for (const auto& face : its.indices) {
-                    indices.push_back(base_idx + face[0]);
-                    indices.push_back(base_idx + face[1]);
-                    indices.push_back(base_idx + face[2]);
-                }
-
-                BoundingBoxf3 inst_bb = mesh.bounding_box();
-                inst_bb = inst_bb.transformed(xform);
-                bbox.merge(inst_bb);
-            }
+            for (const ModelInstance* inst : obj->instances)
+                append_mesh(mesh.its, inst->get_matrix().matrix(), vertices, indices, bbox);
         }
     }
+    const unsigned int model_index_count = (unsigned int)indices.size() - model_index_start;
 
     if (vertices.empty()) return data;
     // --- Compile shaders ---
@@ -508,13 +542,12 @@ ThumbnailData ThumbnailRenderer::render(
     p_glUniformMatrix4fv(loc_vm, 1, GL_FALSE, view_f.data());
     p_glUniformMatrix4fv(loc_pj, 1, GL_FALSE, proj_f.data());
     p_glUniformMatrix3fv(loc_nm, 1, GL_FALSE, norm_f.data());
-    p_glUniform4f(loc_color, color_r, color_g, color_b, color_a);
     p_glUniform1f(loc_emission, 0.0f);
 
     GLint loc_pos = p_glGetAttribLocation(prog, "v_position");
     GLint loc_nor = p_glGetAttribLocation(prog, "v_normal");
 
-    // Upload geometry to GPU via VAO + VBO + EBO (required for GL 3.1 core).
+    // Upload all geometry (bed + model) to GPU via VAO + VBO + EBO.
     GLuint vao = 0, vbo = 0, ebo = 0;
     p_glGenVertexArrays(1, &vao);
     p_glBindVertexArray(vao);
@@ -529,17 +562,25 @@ ThumbnailData ThumbnailRenderer::render(
     p_glBufferData(GL_ELEMENT_ARRAY_BUFFER,
         indices.size() * sizeof(unsigned int), indices.data(), GL_STATIC_DRAW);
 
-    // v_position: 3 floats at offset 0
     p_glEnableVertexAttribArray(loc_pos);
     p_glVertexAttribPointer(loc_pos, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex),
         (const void*)offsetof(Vertex, pos));
-
-    // v_normal: 3 floats at offset 12 (after pos[3])
     p_glEnableVertexAttribArray(loc_nor);
     p_glVertexAttribPointer(loc_nor, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex),
         (const void*)offsetof(Vertex, normal));
 
-    glDrawElements(GL_TRIANGLES, (GLsizei)indices.size(), GL_UNSIGNED_INT, nullptr);
+    // Draw bed plate first (dark grey, behind model).
+    if (bed_index_count > 0) {
+        p_glUniform4f(loc_color, 0.25f, 0.25f, 0.25f, 1.0f);
+        glDrawElements(GL_TRIANGLES, (GLsizei)bed_index_count, GL_UNSIGNED_INT, nullptr);
+    }
+
+    // Draw model (user-specified color, default orange).
+    if (model_index_count > 0) {
+        p_glUniform4f(loc_color, color_r, color_g, color_b, color_a);
+        glDrawElements(GL_TRIANGLES, (GLsizei)model_index_count, GL_UNSIGNED_INT,
+            (const void*)(model_index_start * sizeof(unsigned int)));
+    }
 
     p_glDisableVertexAttribArray(loc_pos);
     p_glDisableVertexAttribArray(loc_nor);

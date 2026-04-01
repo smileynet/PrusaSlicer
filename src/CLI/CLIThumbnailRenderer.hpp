@@ -34,6 +34,8 @@ public:
     /// @param width   Output width in pixels.
     /// @param height  Output height in pixels.
     /// @param color   RGBA color for the mesh (default: PrusaSlicer orange).
+    /// @param bed_model_path  Path to bed plate STL (empty = no bed).
+    /// @param bed_center      Bed center in model coordinates (from bed_shape).
     static ThumbnailData render(
         const Model& model,
         unsigned int  width,
@@ -41,7 +43,10 @@ public:
         float color_r = 1.0f,
         float color_g = 0.5f,
         float color_b = 0.0f,
-        float color_a = 1.0f
+        float color_a = 1.0f,
+        const std::string& bed_model_path = "",
+        double bed_center_x = 0.0,
+        double bed_center_y = 0.0
     );
 
     static bool is_initialized() { return s_initialized; }
