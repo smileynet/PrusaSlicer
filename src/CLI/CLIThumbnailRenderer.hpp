@@ -34,8 +34,10 @@ public:
     /// @param width   Output width in pixels.
     /// @param height  Output height in pixels.
     /// @param color   RGBA color for the mesh (default: PrusaSlicer orange).
-    /// @param bed_model_path  Path to bed plate STL (empty = no bed).
-    /// @param bed_center      Bed center in model coordinates (from bed_shape).
+    /// @param bed_model_path    Path to bed plate STL fallback (empty = no bed).
+    /// @param bed_center         Bed center in model coordinates (from bed_shape).
+    /// @param bed_texture_path   Path to bed SVG texture (empty = use STL fallback).
+    /// @param bed_width/height   Bed dimensions in mm (from bed_shape, for textured quad).
     static ThumbnailData render(
         const Model& model,
         unsigned int  width,
@@ -46,7 +48,10 @@ public:
         float color_a = 1.0f,
         const std::string& bed_model_path = "",
         double bed_center_x = 0.0,
-        double bed_center_y = 0.0
+        double bed_center_y = 0.0,
+        const std::string& bed_texture_path = "",
+        double bed_width  = 0.0,
+        double bed_height = 0.0
     );
 
     static bool is_initialized() { return s_initialized; }

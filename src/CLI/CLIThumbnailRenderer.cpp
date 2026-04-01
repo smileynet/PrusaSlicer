@@ -20,6 +20,11 @@
 #include <vector>
 #include <algorithm>
 
+#define NANOSVG_IMPLEMENTATION
+#include <nanosvg/nanosvg.h>
+#define NANOSVGRAST_IMPLEMENTATION
+#include <nanosvg/nanosvgrast.h>
+
 #include <boost/log/trivial.hpp>
 #include <Eigen/Geometry>
 
@@ -40,6 +45,8 @@ static PFNGLGETUNIFORMLOCATIONPROC  p_glGetUniformLocation  = nullptr;
 static PFNGLUNIFORM4FPROC           p_glUniform4f           = nullptr;
 static PFNGLUNIFORM1FPROC           p_glUniform1f           = nullptr;
 static PFNGLUNIFORMMATRIX4FVPROC    p_glUniformMatrix4fv    = nullptr;
+static PFNGLUNIFORM1IPROC            p_glUniform1i           = nullptr;
+static PFNGLACTIVETEXTUREPROC        p_glActiveTexture       = nullptr;
 static PFNGLUNIFORMMATRIX3FVPROC    p_glUniformMatrix3fv    = nullptr;
 static PFNGLGETATTRIBLOCATIONPROC   p_glGetAttribLocation   = nullptr;
 static PFNGLENABLEVERTEXATTRIBARRAYPROC  p_glEnableVertexAttribArray = nullptr;
@@ -82,6 +89,8 @@ static bool load_gl_functions()
     LOAD(glGetUniformLocation)
     LOAD(glUniform4f)
     LOAD(glUniform1f)
+    LOAD(glUniform1i)
+    LOAD(glActiveTexture)
     LOAD(glUniformMatrix4fv)
     LOAD(glUniformMatrix3fv)
     LOAD(glGetAttribLocation)
@@ -161,6 +170,47 @@ void main() {
 }
 )glsl";
 
+// Printbed shader -- textured bed quad with SVG radial gradient background.
+// Matches resources/shaders/140/printbed.{vs,fs} from the GUI.
+static const char* BED_VS_SOURCE = R"glsl(
+#version 140
+uniform mat4 view_model_matrix;
+uniform mat4 projection_matrix;
+in vec3 v_position;
+in vec2 v_tex_coord;
+out vec2 tex_coord;
+void main() {
+    tex_coord = v_tex_coord;
+    gl_Position = projection_matrix * view_model_matrix * vec4(v_position, 1.0);
+}
+)glsl";
+
+static const char* BED_FS_SOURCE = R"glsl(
+#version 140
+const vec3 back_color_dark  = vec3(0.235, 0.235, 0.235);
+const vec3 back_color_light = vec3(0.365, 0.365, 0.365);
+uniform sampler2D in_texture;
+uniform bool transparent_background;
+uniform bool svg_source;
+in vec2 tex_coord;
+out vec4 out_color;
+vec4 svg_color() {
+    vec4 fore_color = texture(in_texture, tex_coord);
+    vec3 back_color = vec3(mix(back_color_light, back_color_dark,
+        smoothstep(0.0, 0.5, length(abs(tex_coord.xy) - vec2(0.5)))));
+    return vec4(mix(back_color, fore_color.rgb, fore_color.a),
+        transparent_background ? fore_color.a : 1.0);
+}
+vec4 non_svg_color() {
+    vec4 color = texture(in_texture, tex_coord);
+    return vec4(color.rgb, transparent_background ? color.a * 0.25 : color.a);
+}
+void main() {
+    vec4 color = svg_source ? svg_color() : non_svg_color();
+    color.a = transparent_background ? color.a * 0.5 : color.a;
+    out_color = color;
+}
+)glsl";
 
 bool ThumbnailRenderer::init()
 {
@@ -289,6 +339,49 @@ static GLuint compile_shader(GLenum type, const char* source)
     return shader;
 }
 
+
+// Rasterize an SVG file to an RGBA GL texture. Returns texture ID (0 on failure).
+static GLuint rasterize_svg_to_texture(const std::string& svg_path)
+{
+    NSVGimage* image = nsvgParseFromFile(svg_path.c_str(), "px", 96.0f);
+    if (!image) {
+        BOOST_LOG_TRIVIAL(warning) << "CLI Thumbnail: Failed to parse SVG: " << svg_path;
+        return 0;
+    }
+
+    // Rasterize at a fixed resolution. 1024px on the long edge is plenty for a thumbnail.
+    const float svg_w = image->width;
+    const float svg_h = image->height;
+    const int tex_long = 1024;
+    int tex_w, tex_h;
+    if (svg_w >= svg_h) {
+        tex_w = tex_long;
+        tex_h = (int)(tex_long * svg_h / svg_w + 0.5f);
+    } else {
+        tex_h = tex_long;
+        tex_w = (int)(tex_long * svg_w / svg_h + 0.5f);
+    }
+
+    std::vector<unsigned char> pixels(tex_w * tex_h * 4, 0);
+    NSVGrasterizer* rast = nsvgCreateRasterizer();
+    if (!rast) { nsvgDelete(image); return 0; }
+    nsvgRasterize(rast, image, 0, 0,
+        std::min((float)tex_w / svg_w, (float)tex_h / svg_h),
+        pixels.data(), tex_w, tex_h, tex_w * 4);
+    nsvgDeleteRasterizer(rast);
+    nsvgDelete(image);
+
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, tex_w, tex_h, 0,
+        GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return tex;
+}
+
 // Interleaved vertex: position + normal, 24 bytes.
 struct Vertex { float pos[3]; float normal[3]; };
 
@@ -346,7 +439,9 @@ ThumbnailData ThumbnailRenderer::render(
     unsigned int width, unsigned int height,
     float color_r, float color_g, float color_b, float color_a,
     const std::string& bed_model_path,
-    double bed_center_x, double bed_center_y)
+    double bed_center_x, double bed_center_y,
+    const std::string& bed_texture_path,
+    double bed_width, double bed_height)
 
 {
     ThumbnailData data;
@@ -371,10 +466,21 @@ ThumbnailData ThumbnailRenderer::render(
     }
     const unsigned int model_index_count = (unsigned int)indices.size();
 
-    // --- Bed plate (cosmetic backdrop, does not affect framing) ---
-    const unsigned int bed_index_start = (unsigned int)indices.size();
-    unsigned int bed_index_count = 0;
-    if (!bed_model_path.empty()) {
+    // --- Bed (cosmetic backdrop, does not affect camera framing) ---
+    // Prefer textured quad (SVG) over dark grey STL model.
+    const unsigned int bed_stl_index_start = (unsigned int)indices.size();
+    unsigned int bed_stl_index_count = 0;
+    bool use_bed_texture = false;
+
+    if (!bed_texture_path.empty() && bed_width > 0 && bed_height > 0) {
+        // Textured quad -- geometry is built later with a different vertex layout.
+        // Just compute bed_bbox for near/far extension.
+        use_bed_texture = true;
+        const double z = -0.02;
+        bed_bbox.merge(Vec3d(0, 0, z));
+        bed_bbox.merge(Vec3d(bed_width, bed_height, z));
+    } else if (!bed_model_path.empty()) {
+        // Fallback: dark grey STL model
         TriangleMesh bed_mesh;
         if (bed_mesh.ReadSTLFile(bed_model_path.c_str())) {
             Eigen::Matrix4d bed_xform = Eigen::Matrix4d::Identity();
@@ -382,7 +488,7 @@ ThumbnailData ThumbnailRenderer::render(
             bed_xform(1, 3) = bed_center_y;
             bed_xform(2, 3) = -0.03;
             append_mesh(bed_mesh.its, bed_xform, vertices, indices, bed_bbox);
-            bed_index_count = (unsigned int)indices.size() - bed_index_start;
+            bed_stl_index_count = (unsigned int)indices.size() - bed_stl_index_start;
         } else {
             BOOST_LOG_TRIVIAL(warning) << "CLI Thumbnail: Could not load bed model: " << bed_model_path;
         }
@@ -597,14 +703,90 @@ ThumbnailData ThumbnailRenderer::render(
         glDrawElements(GL_TRIANGLES, (GLsizei)model_index_count, GL_UNSIGNED_INT, nullptr);
     }
 
-    // Pass 2: Bed with depth test ON.
-    // Bed sits at Z~0 below the model. The depth buffer from Pass 1 ensures
-    // the model naturally occludes the bed via Z ordering.
-    // (GUI: render_internal re-enables depth test despite caller disabling it.)
-    if (bed_index_count > 0) {
+    // Pass 2: Bed rendering.
+    if (use_bed_texture) {
+        // Rasterize SVG to texture
+        GLuint bed_tex = rasterize_svg_to_texture(bed_texture_path);
+        if (bed_tex) {
+            // Compile printbed shader
+            GLuint bed_vs = compile_shader(GL_VERTEX_SHADER, BED_VS_SOURCE);
+            GLuint bed_fs = compile_shader(GL_FRAGMENT_SHADER, BED_FS_SOURCE);
+            GLuint bed_prog = 0;
+            if (bed_vs && bed_fs) {
+                bed_prog = p_glCreateProgram();
+                p_glAttachShader(bed_prog, bed_vs);
+                p_glAttachShader(bed_prog, bed_fs);
+                p_glLinkProgram(bed_prog);
+                GLint bed_link_ok = 0;
+                p_glGetProgramiv(bed_prog, GL_LINK_STATUS, &bed_link_ok);
+                if (!bed_link_ok) { p_glDeleteProgram(bed_prog); bed_prog = 0; }
+            }
+            if (bed_vs) p_glDeleteShader(bed_vs);
+            if (bed_fs) p_glDeleteShader(bed_fs);
+
+            if (bed_prog) {
+                // Build textured quad: 4 vertices (P3T2), 2 triangles.
+                // Bed rectangle at Z=-0.02, matching GUI's GROUND_Z.
+                struct BedVtx { float pos[3]; float uv[2]; };
+                const float z = -0.02f;
+                BedVtx bed_verts[4] = {
+                    {{0,               0,                z}, {0, 1}},  // bottom-left, UV Y-flipped for SVG
+                    {{(float)bed_width, 0,                z}, {1, 1}},
+                    {{(float)bed_width, (float)bed_height, z}, {1, 0}},
+                    {{0,               (float)bed_height, z}, {0, 0}},
+                };
+                unsigned int bed_idx[6] = {0,1,2, 0,2,3};
+
+                GLuint bed_vao = 0, bed_vbo = 0, bed_ebo = 0;
+                p_glGenVertexArrays(1, &bed_vao);
+                p_glBindVertexArray(bed_vao);
+
+                p_glGenBuffers(1, &bed_vbo);
+                p_glBindBuffer(GL_ARRAY_BUFFER, bed_vbo);
+                p_glBufferData(GL_ARRAY_BUFFER, sizeof(bed_verts), bed_verts, GL_STATIC_DRAW);
+
+                p_glGenBuffers(1, &bed_ebo);
+                p_glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, bed_ebo);
+                p_glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(bed_idx), bed_idx, GL_STATIC_DRAW);
+
+                GLint bed_loc_pos = p_glGetAttribLocation(bed_prog, "v_position");
+                GLint bed_loc_uv  = p_glGetAttribLocation(bed_prog, "v_tex_coord");
+                p_glEnableVertexAttribArray(bed_loc_pos);
+                p_glVertexAttribPointer(bed_loc_pos, 3, GL_FLOAT, GL_FALSE, sizeof(BedVtx), (const void*)0);
+                p_glEnableVertexAttribArray(bed_loc_uv);
+                p_glVertexAttribPointer(bed_loc_uv, 2, GL_FLOAT, GL_FALSE, sizeof(BedVtx), (const void*)12);
+
+                p_glUseProgram(bed_prog);
+                p_glUniformMatrix4fv(p_glGetUniformLocation(bed_prog, "view_model_matrix"), 1, GL_FALSE, view_f.data());
+                p_glUniformMatrix4fv(p_glGetUniformLocation(bed_prog, "projection_matrix"), 1, GL_FALSE, proj_f.data());
+                p_glUniform1i(p_glGetUniformLocation(bed_prog, "svg_source"), 1);
+                p_glUniform1i(p_glGetUniformLocation(bed_prog, "transparent_background"), 0);
+
+                p_glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, bed_tex);
+                p_glUniform1i(p_glGetUniformLocation(bed_prog, "in_texture"), 0);
+
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, nullptr);
+                glDisable(GL_BLEND);
+
+                glBindTexture(GL_TEXTURE_2D, 0);
+                p_glDisableVertexAttribArray(bed_loc_pos);
+                p_glDisableVertexAttribArray(bed_loc_uv);
+                p_glBindVertexArray(0);
+                p_glDeleteBuffers(1, &bed_ebo);
+                p_glDeleteBuffers(1, &bed_vbo);
+                p_glDeleteVertexArrays(1, &bed_vao);
+                p_glDeleteProgram(bed_prog);
+            }
+            glDeleteTextures(1, &bed_tex);
+        }
+    } else if (bed_stl_index_count > 0) {
+        // Fallback: dark grey STL bed model.
         p_glUniform4f(loc_color, 0.25f, 0.25f, 0.25f, 1.0f);
-        glDrawElements(GL_TRIANGLES, (GLsizei)bed_index_count, GL_UNSIGNED_INT,
-            (const void*)(bed_index_start * sizeof(unsigned int)));
+        glDrawElements(GL_TRIANGLES, (GLsizei)bed_stl_index_count, GL_UNSIGNED_INT,
+            (const void*)(bed_stl_index_start * sizeof(unsigned int)));
     }
 
     p_glDisableVertexAttribArray(loc_pos);
@@ -650,7 +832,8 @@ bool ThumbnailRenderer::s_initialized = false;
 bool ThumbnailRenderer::init()     { return false; }
 void ThumbnailRenderer::shutdown() {}
 ThumbnailData ThumbnailRenderer::render(const Model&, unsigned int, unsigned int,
-    float, float, float, float) { return ThumbnailData(); }
+    float, float, float, float, const std::string&, double, double,
+    const std::string&, double, double) { return ThumbnailData(); }
 }} // namespace Slic3r::CLI
 
 #endif // SLIC3R_CLI_THUMBNAILS
